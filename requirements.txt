@@ -1,0 +1,18 @@
+# Recommended target environment for Great Lakes / GPU:
+# 1. Create a Python 3.9 env.
+# 2. Install PyTorch 2.1.0 with CUDA 12.1 via conda:
+#    conda install pytorch==2.1.0 torchvision==0.16.0 torchaudio==2.1.0 pytorch-cuda=12.1 -c pytorch -c nvidia
+# 3. Then install the packages below with pip.
+#
+# Notes:
+# - These versions are scoped to the jumpstart_bundle graph-construction scripts only.
+# - `torch` is intentionally not pinned here because the recommended install path on
+#   Great Lakes is the conda GPU build above, not the default pip wheel.
+# - `torch-scatter` and `torch-sparse` are not required by these builder/split scripts,
+#   but many downstream PyG training models will need them:
+#   pip install torch-scatter torch-sparse -f https://data.pyg.org/whl/torch-2.1.0+cu121.html
+
+numpy==1.26.4
+pandas>=1.5,<2.2
+torch-geometric==2.4.0
+tqdm>=4.64,<5
