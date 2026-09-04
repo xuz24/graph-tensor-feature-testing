@@ -57,6 +57,7 @@ from __future__ import annotations
 import argparse
 import csv
 from collections import defaultdict
+from math import comb
 from pathlib import Path
 
 import numpy as np
@@ -292,29 +293,84 @@ class SynergyModel(nn.Module):
         return self.decoder(E[i_idx], E[j_idx], self.cell_emb(cell_idx))
 
 
+def query_group_sizes(d1, d2, cell, y, idx, label, min_candidates=1):
+    """Smoke test: how many candidates does each (anchor drug, cell) query actually have in this
+    split? If the median is tiny (2-3), within-query MRR is close to a coin flip regardless of
+    model quality -- this reports both the raw distribution and how many queries survive the
+    min_candidates filter actually used for scoring. Run once per fold, not per epoch/arm, since
+    it only depends on the split, not the model.
+    """
+    anchors = np.concatenate([d1[idx], d2[idx]])
+    cells_ = np.concatenate([cell[idx], cell[idx]])
+    labs = np.concatenate([y[idx], y[idx]])
+    groups = defaultdict(list)
+    for a, c, yv in zip(anchors, cells_, labs):
+        groups[(a, c)].append(yv)
+    sizes = np.array([len(v) for v in groups.values() if sum(v) > 0])
+    if sizes.size == 0:
+        print(f"  [diag:{label}] no qualifying (>=1 positive) query groups found")
+        return
+    print(f"  [diag:{label}] qualifying query groups (>=1 positive): {sizes.size:,}  "
+          f"candidates/query -- min {sizes.min()}  p25 {np.percentile(sizes,25):.0f}  "
+          f"median {np.median(sizes):.0f}  mean {sizes.mean():.1f}  max {sizes.max()}")
+    kept = int((sizes >= min_candidates).sum())
+    print(f"  [diag:{label}] at min_candidates={min_candidates}: {kept:,}/{sizes.size:,} "
+          f"queries survive ({kept/sizes.size:.1%})")
+    if np.median(sizes) <= 3 and min_candidates <= 1:
+        print(f"  [diag:{label}] WARNING: median group size <= 3 and no min_candidates filter is "
+              f"applied -- wq_mrr here is close to chance-level discrimination; use --min-query-size")
+
+
 # ═══════════════════════════════════════════════════════════════════════════════════════════
-# 4. Metrics: AUROC/AUPRC + approximate within-query MRR
+# 4. Metrics: AUROC/AUPRC + exact expected within-query MRR under random tie-breaking
 # ═══════════════════════════════════════════════════════════════════════════════════════════
-def within_query_mrr(anchors, cells_, labels, scores):
-    """Fix (anchor drug, cell), rank candidates by score, take reciprocal rank of the first
-    positive. Each undirected test row contributes two queries (drug1 as anchor, drug2 as anchor)
-    since "fix the anchor, rank partners" is direction-specific."""
+def expected_reciprocal_rank(yy: np.ndarray, sc: np.ndarray):
+    """Exact E[1/rank] of the FIRST positive under random tie-breaking (no sampling needed).
+
+    Only the tie group sharing the best positive's score is ambiguous -- everything strictly
+    above it is a fixed offset `g`, and a naive stable sort would silently pick one arbitrary
+    ordering within that tie group instead of averaging over all of them. That matters a lot
+    once training has driven the decoder's sigmoid outputs to saturation (near-0 train loss by
+    epoch ~30 in our runs means many candidates can land on the *same* float32 score).
+    """
+    pos = yy == 1
+    if not pos.any():
+        return None
+    best = sc[pos].max()
+    g = int((sc > best).sum())
+    grp = sc == best
+    t, pp = int(grp.sum()), int((grp & pos).sum())
+    denom = comb(t, pp)
+    return float(sum(comb(t - k, pp - 1) / denom / (g + k)
+                     for k in range(1, t - pp + 2)))
+
+
+def within_query_mrr(anchors, cells_, labels, scores, min_candidates=1):
+    """Fix (anchor drug, cell), rank candidates by score, take expected reciprocal rank of the
+    first positive under random tie-breaking. Each undirected test row contributes two queries
+    (drug1 as anchor, drug2 as anchor) since "fix the anchor, rank partners" is direction-specific.
+
+    min_candidates filters out queries too small to be informative: a group of size 1 has
+    reciprocal rank 1.0 unconditionally (nothing to rank against), and a group of size 2 is
+    bounded in [0.5, 1.0] even for a coin-flip model. Averaging those in unweighted with genuinely
+    hard, larger queries inflates and flattens the metric across arms -- see query_group_sizes.
+    """
     groups = defaultdict(list)
     for a, c, y, s in zip(anchors, cells_, labels, scores):
-        groups[(a, c)].append((s, y))
+        groups[(a, c)].append((y, s))
     rr = []
     for (_a, _c), items in groups.items():
-        if not any(y == 1 for _, y in items):
+        if len(items) < min_candidates:
             continue
-        items.sort(key=lambda t: -t[0])
-        for rank, (_s, y) in enumerate(items, start=1):
-            if y == 1:
-                rr.append(1.0 / rank)
-                break
+        yy = np.array([y for y, _ in items])
+        sc = np.array([s for _, s in items])
+        val = expected_reciprocal_rank(yy, sc)
+        if val is not None:
+            rr.append(val)
     return float(np.mean(rr)) if rr else float("nan"), len(rr)
 
 
-def evaluate(model, idx, d1, d2, cell, y, device, batch=4096):
+def evaluate(model, idx, d1, d2, cell, y, device, min_candidates=1, batch=4096):
     model.eval()
     all_scores = []
     with torch.no_grad():
@@ -334,7 +390,7 @@ def evaluate(model, idx, d1, d2, cell, y, device, batch=4096):
     cells_ = np.concatenate([cell[idx], cell[idx]])
     labs = np.concatenate([labels, labels])
     scs = np.concatenate([scores, scores])
-    mrr, n_q = within_query_mrr(anchors, cells_, labs, scs)
+    mrr, n_q = within_query_mrr(anchors, cells_, labs, scs, min_candidates=min_candidates)
     return {"auroc": auroc, "auprc": auprc, "wq_mrr": mrr, "n_queries": n_q}
 
 
@@ -342,7 +398,7 @@ def evaluate(model, idx, d1, d2, cell, y, device, batch=4096):
 # 5. Training loop
 # ═══════════════════════════════════════════════════════════════════════════════════════════
 def train_arm(arm, N, num_cells, node_feat, edge_index, d1, d2, cell, y, tr, va, te,
-             epochs, lr, device, out_dim=64):
+             epochs, lr, device, out_dim=64, min_candidates=1):
     model = SynergyModel(arm, N, num_cells, node_feat, edge_index, out_dim=out_dim).to(device)
     opt = torch.optim.Adam(model.parameters(), lr=lr)
     loss_fn = nn.BCEWithLogitsLoss()
@@ -364,7 +420,7 @@ def train_arm(arm, N, num_cells, node_feat, edge_index, d1, d2, cell, y, tr, va,
             loss.backward()
             opt.step()
             epoch_loss += loss.item() * len(b)
-        val_metrics = evaluate(model, va, d1, d2, cell, y, device)
+        val_metrics = evaluate(model, va, d1, d2, cell, y, device, min_candidates=min_candidates)
         if epoch % max(1, epochs // 5) == 0 or epoch == epochs:
             print(f"    [{arm}] epoch {epoch:3d}  train_loss {epoch_loss/len(tr):.4f}  "
                   f"val_auroc {val_metrics['auroc']:.3f}  val_wq_mrr {val_metrics['wq_mrr']:.3f}")
@@ -373,7 +429,7 @@ def train_arm(arm, N, num_cells, node_feat, edge_index, d1, d2, cell, y, tr, va,
             best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
     if best_state is not None:
         model.load_state_dict(best_state)
-    test_metrics = evaluate(model, te, d1, d2, cell, y, device)
+    test_metrics = evaluate(model, te, d1, d2, cell, y, device, min_candidates=min_candidates)
     return test_metrics
 
 
@@ -391,6 +447,10 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--topk", type=int, default=30)
     ap.add_argument("--tucker-rank", type=int, nargs=3, default=[64, 64, 3])
+    ap.add_argument("--min-query-size", type=int, default=1,
+                    help="drop within-query MRR groups with fewer than this many candidates; "
+                         "size-1 groups are trivially correct and size-2 groups are bounded in "
+                         "[0.5, 1.0] regardless of model skill -- see the query_group_sizes diag")
     ap.add_argument("--embed-dim", type=int, default=64)
     ap.add_argument("--epochs", type=int, default=60)
     ap.add_argument("--lr", type=float, default=1e-3)
@@ -412,6 +472,8 @@ def main():
     tr, va, te = make_split(a.setup, a.fold, a.num_folds, a.seed, drugs, cells, d1, d2, cell, y)
     print(f"{a.setup} fold {a.fold}: train {len(tr):,} ({len(tr)/len(y):.1%})  "
           f"val {len(va):,}  test {len(te):,}")
+    query_group_sizes(d1, d2, cell, y, va, "val", min_candidates=a.min_query_size)
+    query_group_sizes(d1, d2, cell, y, te, "test", min_candidates=a.min_query_size)
 
     fp_path = a.data_root / "drug_features" / "drug_atompair.npz"
     z = np.load(fp_path, allow_pickle=True)
@@ -439,7 +501,8 @@ def main():
         print(f"\n== arm: {arm} ==")
         node_feat = node_feat_tucker if arm == "sage_tucker" else node_feat_plain
         results[arm] = train_arm(arm, N, num_cells, node_feat, e_sim, d1, d2, cell, y,
-                                 tr, va, te, a.epochs, a.lr, device, out_dim=a.embed_dim)
+                                 tr, va, te, a.epochs, a.lr, device, out_dim=a.embed_dim,
+                                 min_candidates=a.min_query_size)
 
     print(f"\n{'arm':14s} {'auroc':>7s} {'auprc':>7s} {'wq_mrr':>8s} {'n_queries':>10s}")
     for arm, m in results.items():

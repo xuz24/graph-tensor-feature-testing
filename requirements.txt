@@ -5,14 +5,24 @@
 # 3. Then install the packages below with pip.
 #
 # Notes:
-# - These versions are scoped to the jumpstart_bundle graph-construction scripts only.
+# - These versions are scoped to the jumpstart_bundle graph-construction scripts, PLUS
+#   tensograph_sage.py (Tucker decomposition + GraphSAGE baseline) built on top of them.
 # - `torch` is intentionally not pinned here because the recommended install path on
 #   Great Lakes is the conda GPU build above, not the default pip wheel.
-# - `torch-scatter` and `torch-sparse` are not required by these builder/split scripts,
-#   but many downstream PyG training models will need them:
+# - `torch-geometric==2.4.0` is compiled against torch 2.1.0+cu121 -- if you change the
+#   conda torch version above, get the matching PyG wheel index from
+#   https://data.pyg.org/whl/ rather than just bumping this pin.
+# - `torch-scatter` and `torch-sparse` are not required by tensograph_sage.py's SAGEConv
+#   layers or by the original builder/split scripts, but many other downstream PyG models
+#   will need them:
 #   pip install torch-scatter torch-sparse -f https://data.pyg.org/whl/torch-2.1.0+cu121.html
-
 numpy==1.26.4
 pandas>=1.5,<2.2
 torch-geometric==2.4.0
 tqdm>=4.64,<5
+
+# --- added for tensograph_sage.py ---------------------------------------------------
+scipy>=1.10,<1.12          # tensorly's numpy backend and sklearn both pull this in transitively;
+                            # pinned explicitly since scipy>=1.12 drops Python 3.9 support
+tensorly>=0.8.1,<0.9        # Tucker decomposition (tucker() call in build_tucker_embeddings)
+scikit-learn>=1.2,<1.5      # roc_auc_score / average_precision_score in the eval step
