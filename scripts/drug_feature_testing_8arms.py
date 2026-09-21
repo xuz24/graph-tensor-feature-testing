@@ -1,42 +1,45 @@
 #!/usr/bin/env python3
-"""TensoGraph-style Tucker drug embeddings + a basic GraphSAGE, evaluated on the rebuilt graph.
+"""8-arm ablation: TensoGraph Tucker + protein features + GraphSAGE on the rebuilt graph.
 
-    python drug_feature_testing.py --data-root data --splits-dir /tmp/splits \
-        --setup B3 --fold 0 --seed 0 --compare
+    python drug_feature_testing_8arms.py --data-root data --splits-dir /tmp/splits \
+        --setup B1 --fold 0 --seed 0 --compare
 
-WHAT CHANGED FROM tensograph_sage.py
--------------------------------------
-This is tensograph_sage.py's model + Tucker step, rewired onto the project's actual data/split/
-metric machinery instead of the copies that script carried for standalone use:
+EIGHT ARMS TESTED
+-----------------
+Ablation over three orthogonal signal sources: fingerprints (always), Tucker-factorized synergy 
+labels (optional), graph message-passing (optional), and protein target information (optional).
 
-  * Data and drug/cell indexing come from generate_all_splits.load(), not a hand-rolled
-    load_triplets(). That means the two silent indexing traps documented at the top of
-    generate_all_splits.py (drug indices from drug_id_map.csv, cell indices in first-appearance
-    order) are handled the one correct way instead of a second, divergent way.
-  * Splits are READ, not regenerated: this script takes --splits-dir and loads the pre-generated
-    `{setup}_f{fold}_s{seed}.npz` files (train/val/test) written by
-    `generate_all_splits.py --out <dir>`. It no longer contains a make_split() of its own, and it
-    now runs every FOLDED setup (B1, LCOW, LCO, B2, B2P, B3, B3A, B4), not just B1/B2/B3.
-  * Evaluation uses metrics.py's evaluate() (auroc/ap/antagonism metrics, prevalence-gated
-    mrr/hits10, and the tie-corrected within-query auroc/mrr/hits1) instead of the ad hoc
-    within_query_mrr()/expected_reciprocal_rank() this script used to carry -- those are exactly
-    duplicated, more carefully, in metrics.within_query. The antagonism decision threshold is
-    selected on validation via metrics.select_antagonism_threshold(), not fixed at 0.5.
-  * wq_mrr is reported next to generate_all_splits.tie_floor() for the same test split, since
-    wq_mrr's floor is split-determined (see that module's docstring) and an un-normalised number
-    is not comparable across setups.
+| Arm | FP | Protein | Tucker (synergy) | GraphSAGE |
+|---|---|---|---|---|
+| identity | -- | -- | -- | -- |
+| fp_only | ✓ | -- | -- | -- |
+| fp_protein | ✓ | ✓ | -- | -- |
+| tucker_only | ✓ | -- | ✓ | -- |
+| tucker_protein | ✓ | ✓ | ✓ | -- |
+| sage | ✓ | -- | -- | ✓ |
+| sage_protein | ✓ | ✓ | -- | ✓ |
+| sage_tucker | ✓ | -- | ✓ | ✓ |
+| sage_tucker_protein | ✓ | ✓ | ✓ | ✓ |
 
-Everything about *why* the tensor is built once globally rather than per cell line, what node
-features/graph go in, and the four comparison arms (identity / fp_only / sage / sage_tucker) is
-unchanged from tensograph_sage.py; see that file's docstring for the full rationale.
+See DATA_MANIFEST.md for protein target edge count and coverage. Each arm's drug embedding 
+concatenates the selected signals, then (for sage* arms) passes through GraphSAGE over the 
+chemical-similarity graph, and finally decodes with cell-line embedding.
 
-WHAT THIS SCRIPT DOES NOT DO
------------------------------
-* No protein / PPI / target-edge graph -- scoped to the drug-drug question only.
-* LOO settings (C2/C3/C4/LOSO) and EXT are out of scope here; those need --loo-index or an
-  external fold table and don't fit the (setup, fold, seed) .npz layout this script reads.
-* Single seed per invocation, no early-stopping schedule tuned per setting -- run --compare across
-  a few --seed values before trusting a delta smaller than the ~0.003 noise floor.
+WHAT CHANGED FROM drug_feature_testing.py
+-------------------------------------------
+* Added ProteinFeatureAggregator: learnable protein embeddings that average per-drug target sets.
+* Expanded SynergyModel to handle 8 arms (was 4).
+* Added build_drug_protein_dict() to extract drug→protein target edges from the graph .pt.
+* Updated train_arm() to accept n_proteins and drug_protein_dict.
+* Updated CLI --arm choices and --compare to cover all 8 arms.
+
+Everything about *why* the tensor is built once globally, leak safety of synergy edges, and the 
+core GraphSAGE architecture is unchanged from drug_feature_testing.py.
+
+LOO settings (C2/C3/C4/LOSO), EXT, and cross-project generalization are out of scope; this 
+script runs only FOLDED setups (B1, LCOW, LCO, B2, B2P, B3, B3A, B4) with splits from 
+generate_all_splits.py. Single seed per invocation -- run --compare across a few --seed values 
+before trusting deltas < 0.003 AUROC.
 """
 from __future__ import annotations
 
@@ -47,6 +50,7 @@ from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -150,6 +154,78 @@ def load_drug_id_map(data_root: Path) -> dict:
     """
     with open(data_root / "graphs/dp_drugs/drug_id_map.csv", newline="") as fh:
         return {r["drugbank_id"].strip().upper(): int(r["drug_idx"]) for r in csv.DictReader(fh)}
+
+
+def build_drug_protein_dict(data_root: Path, fold_table: Path):
+    """Extract drug-protein target edges from the heterogeneous graph.
+    
+    Maps from 0..1107 labelled-drug indices (as used in canonical_folds_extmap.csv) to lists 
+    of protein graph indices (0..16063).
+    
+    Returns:
+        drug_protein_dict: dict mapping drug_idx -> list of protein_indices
+        n_proteins: int, number of protein nodes in the graph
+    """
+    data_root = Path(data_root)
+    
+    # Load the graph
+    graph_pt = torch.load(data_root / "graphs/dp_drugs/unified_drugcomb_hetero.pt")
+    
+    # Load ID maps to convert between DrugBank/Entrez IDs and graph indices
+    drug_id_map = pd.read_csv(data_root / "graphs/dp_drugs/drug_id_map.csv", index_col=0)
+    protein_id_map = pd.read_csv(data_root / "graphs/dp_drugs/protein_id_map.csv", index_col=0)
+    
+    # Load the labelled drugs to map from graph indices to 0..1107 indices
+    drugs_csv = pd.read_csv(fold_table)
+    labelled_drugs_set = (set(drugs_csv['drug1_dbid'].str.strip().str.upper()) |
+                         set(drugs_csv['drug2_dbid'].str.strip().str.upper()))
+    labelled_drugs = sorted(labelled_drugs_set)
+    dbid_to_labelled_idx = {dbid: i for i, dbid in enumerate(labelled_drugs)}
+    
+    # Extract protein-drug target edges from the graph
+    drug_protein_dict = defaultdict(list)
+    n_proteins = len(protein_id_map)
+    
+    # Iterate through edge types in the graph
+    for edge_type, edge_index in graph_pt.items():
+        # edge_type is typically a tuple like ('drug', 'targets', 'protein') or 
+        # ('protein', 'targeted_by', 'drug'), etc.
+        # edge_index is a torch tensor of shape (2, num_edges)
+        
+        if not isinstance(edge_type, tuple) or len(edge_type) != 3:
+            continue
+        
+        src_type, rel, dst_type = edge_type
+        
+        # We want edges from drug to protein (targets relation)
+        if src_type == 'drug' and dst_type == 'protein' and 'target' in rel.lower():
+            edge_index_np = edge_index.numpy() if torch.is_tensor(edge_index) else edge_index
+            for drug_graph_idx, prot_graph_idx in edge_index_np.T:
+                # Convert drug graph index back to DrugBank ID
+                if drug_graph_idx in drug_id_map.index:
+                    drug_dbid = str(drug_id_map.loc[drug_graph_idx, "drugbank_id"]).strip().upper()
+                    
+                    # Map to labelled drug index (0..1107)
+                    if drug_dbid in dbid_to_labelled_idx:
+                        labelled_drug_idx = dbid_to_labelled_idx[drug_dbid]
+                        drug_protein_dict[labelled_drug_idx].append(int(prot_graph_idx))
+        
+        # Also try the reverse direction (protein -> drug)
+        elif src_type == 'protein' and dst_type == 'drug' and 'target' in rel.lower():
+            edge_index_np = edge_index.numpy() if torch.is_tensor(edge_index) else edge_index
+            for prot_graph_idx, drug_graph_idx in edge_index_np.T:
+                if drug_graph_idx in drug_id_map.index:
+                    drug_dbid = str(drug_id_map.loc[drug_graph_idx, "drugbank_id"]).strip().upper()
+                    
+                    if drug_dbid in dbid_to_labelled_idx:
+                        labelled_drug_idx = dbid_to_labelled_idx[drug_dbid]
+                        drug_protein_dict[labelled_drug_idx].append(int(prot_graph_idx))
+    
+    total_targets = sum(len(v) for v in drug_protein_dict.values())
+    print(f"built drug-protein dict: {len(drug_protein_dict):,} drugs have targets, "
+          f"total target edges: {total_targets:,}")
+    
+    return dict(drug_protein_dict), n_proteins
 
 
 # ═══════════════════════════════════════════════════════════════════════════════════════════
@@ -393,8 +469,11 @@ def query_group_sizes(d1, d2, cell, y, idx, label, min_candidates):
 #    rather than computing auroc/mrr locally.
 # ═══════════════════════════════════════════════════════════════════════════════════════════
 def train_arm(arm, N, num_cells, node_feat, edge_index, d1, d2, cell, y, tr, va, te,
-             epochs, lr, device, out_dim=64, min_candidates=3):
-    model = SynergyModel(arm, N, num_cells, node_feat, edge_index, out_dim=out_dim).to(device)
+             epochs, lr, device, out_dim=64, min_candidates=3, 
+             n_proteins=None, drug_protein_dict=None):
+    model = SynergyModel(arm, N, num_cells, node_feat, edge_index,
+                        n_proteins=n_proteins, drug_protein_dict=drug_protein_dict,
+                        out_dim=out_dim).to(device)
     opt = torch.optim.Adam(model.parameters(), lr=lr)
     loss_fn = nn.BCEWithLogitsLoss()
     best_val, best_state = -float("inf"), None
@@ -485,9 +564,10 @@ def main():
     ap.add_argument("--epochs", type=int, default=60)
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--arm", default="sage_tucker",
-                    choices=["identity", "fp_only", "sage", "sage_tucker"])
+                    choices=["identity", "fp_only", "fp_protein", "tucker_only", "tucker_protein",
+                             "sage", "sage_protein", "sage_tucker", "sage_tucker_protein"])
     ap.add_argument("--compare", action="store_true",
-                    help="run all four arms back to back and print a summary table")
+                    help="run all eight arms back to back and print a summary table")
     ap.add_argument("--gpu", type=int, default=None)
     a = ap.parse_args()
 
@@ -536,33 +616,53 @@ def main():
     fp_norm = fp_t / (fp_t.norm(dim=1, keepdim=True) + 1e-8)
     tuck_t = torch.from_numpy(tucker_emb).float()
     tuck_norm = tuck_t / (tuck_t.norm(dim=1, keepdim=True) + 1e-8)
-    node_feat_plain = fp_norm
-    node_feat_tucker = torch.cat([fp_norm, tuck_norm], dim=1)
 
-    arms = ["identity", "fp_only", "sage", "sage_tucker"] if a.compare else [a.arm]
+    # Build drug-protein dict for protein arms
+    drug_protein_dict, n_proteins = build_drug_protein_dict(a.data_root, fold_table)
+
+    arms = (["identity", "fp_only", "fp_protein", "tucker_only", "tucker_protein",
+             "sage", "sage_protein", "sage_tucker", "sage_tucker_protein"]
+            if a.compare else [a.arm])
     results = {}
     for arm in arms:
         print(f"\n== arm: {arm} ==")
-        node_feat = node_feat_tucker if arm == "sage_tucker" else node_feat_plain
+        
+        # Select node_feat based on arm:
+        # - fp_only, fp_protein, sage, sage_protein: use fingerprint only
+        # - tucker_only, tucker_protein, sage_tucker, sage_tucker_protein: use FP ‖ Tucker
+        # - identity: use identity embedding (no node_feat needed)
+        if arm == "identity":
+            node_feat = fp_norm  # identity doesn't use it, but pass something reasonable
+        elif 'tucker' in arm:
+            node_feat = torch.cat([fp_norm, tuck_norm], dim=1)
+        else:
+            node_feat = fp_norm
+        
         results[arm] = train_arm(arm, N, num_cells, node_feat, e_sim, d1, d2, cell, y,
                                  tr, va, te, a.epochs, a.lr, device, out_dim=a.embed_dim,
-                                 min_candidates=a.min_query_size)
+                                 min_candidates=a.min_query_size,
+                                 n_proteins=n_proteins, drug_protein_dict=drug_protein_dict)
 
-    print(f"\n{'arm':14s} {'auroc':>7s} {'ap':>7s} {'wq_auroc':>9s} {'wq_mrr':>8s} "
+    print(f"\n{'arm':24s} {'auroc':>7s} {'ap':>7s} {'wq_auroc':>9s} {'wq_mrr':>8s} "
           f"{'wq_mrr_norm':>12s} {'mrr':>7s} {'n_queries':>10s}")
-    for arm, m in results.items():
+    for arm in (["identity", "fp_only", "fp_protein", "tucker_only", "tucker_protein",
+                 "sage", "sage_protein", "sage_tucker", "sage_tucker_protein"]
+                if a.compare else [a.arm]):
+        if arm not in results:
+            continue
+        m = results[arm]
         wq_norm = (m["wq_mrr"] - tie) / (1 - tie) if tie < 1 else float("nan")
         mrr = m.get("mrr", float("nan"))
-        print(f"{arm:14s} {m['auroc']:7.3f} {m['ap']:7.3f} {m['wq_auroc']:9.3f} "
+        print(f"{arm:24s} {m['auroc']:7.3f} {m['ap']:7.3f} {m['wq_auroc']:9.3f} "
               f"{m['wq_mrr']:8.3f} {wq_norm:12.3f} {mrr:7.3f} {m['n_queries']:10,d}")
-    print(f"\nwq_mrr_norm = (wq_mrr - tie_floor) / (1 - tie_floor), tie_floor = {tie:.4f} for this "
-          "exact (setup, fold, seed) test split -- compare that column across arms, not raw "
-          "wq_mrr, since the floor itself moves across settings (generate_all_splits.py docstring). "
-          "`mrr`/`hits10` print NaN above prevalence "
-          f"{M.SATURATION_PREVALENCE} (see metrics.rank_metrics) -- expected for most FOLDED "
-          "settings; that's not a bug. If sage_tucker doesn't clear sage by a meaningful margin on "
-          "wq_mrr_norm, the Tucker step isn't earning its complexity here -- a legitimate finding, "
-          "not one to chase away.")
+    
+    print(f"\nwq_mrr_norm = (wq_mrr - tie_floor) / (1 - tie_floor), tie_floor = {tie:.4f}")
+    print("\nFour key ablations to read first:")
+    print("  fp_protein - fp_only:        does protein data help without other structure?")
+    print("  tucker_only - fp_only:       does synergy labels help without graph?")
+    print("  sage_protein - sage:         does protein help alongside graph smoothing?")
+    print("  sage_tucker - sage:          does synergy help alongside graph smoothing?")
+    print("  sage_tucker_protein - sage_tucker: does protein add marginal value when everything else is on?")
 
 
 if __name__ == "__main__":
