@@ -72,7 +72,7 @@ def atom_features(atom):
     f = (_onehot_unk(atom.GetSymbol(), SYMBOLS)        # 44
          + _onehot_unk(atom.GetDegree(), SMALL)        # 11
          + _onehot_unk(atom.GetTotalNumHs(), SMALL)    # 11
-         + _onehot_unk(atom.GetImplicitValence(), SMALL)  # 11
+         + _onehot_unk(atom.GetValence(getExplicit=False), SMALL)  # 11
          + [atom.GetIsAromatic()])                     # 1  -> 78
     f = np.array(f, dtype=np.float32)
     return f / f.sum()

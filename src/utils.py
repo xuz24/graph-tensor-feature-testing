@@ -28,7 +28,7 @@ import re
 
 from torch_geometric.data import Batch
 
-from models import DrugGCN, GTN, SemanticAttention, smiles_to_data
+from .models import DrugGCN, GTN, SemanticAttention, smiles_to_data
 
 
 
