@@ -39,10 +39,10 @@ TENSOGRAPH ABLATION  (arms prefixed tg_, nothing from the legacy arms is mixed i
     * GTN edge types are [synergy_pos, synergy_neg, similarity, identity]: the same three channels
       the Tucker tensor uses, built from training rows only (no label leakage), plus identity.
     * Infomax features are not in the data bundle, so the GTN node features are AtomPair-1024.
-    * As in the original code the GTN and GCN are NOT trained: they are seeded random-weight
-      encoders whose outputs are precomputed once and frozen. The GTN's edge-type weights start
-      uniform (softmax of a constant), so it cannot tell a synergistic edge from an antagonistic
-      one; read tg_no_gtn / tg_no_gcn with that in mind.
+    * GTN and GCN weights are trained end to end with the predictor. Their full-drug embeddings
+      are computed once per epoch and shared across that epoch's minibatches.
+    * GTN edge-type weights start uniform (softmax of a constant), so early on it cannot tell a
+      synergistic edge from an antagonistic one; read tg_no_gtn with that in mind.
     * The fusion input is order-dependent (as in the original): drugs are swapped at random in
       training and the two orders' logits are averaged at eval.
     * Expression is z-scored per gene on training cells only; cell lines without expression get a
@@ -82,7 +82,8 @@ def _load_module(name: str, filename: str):
 GAS = _load_module("generate_all_splits", "generate_all_splits.py")
 M = _load_module("metrics", "metrics.py")
 
-from src.models import SynergyModel, TensoGraphAblation, TG_ARMS          # noqa: E402
+from src.models import (SynergyModel, TensoGraphAblation, TG_ARMS,       # noqa: E402
+                        TrainableGCNEncoder, TrainableGTNEncoder)
 from src.utils import (build_coupled_tucker_embeddings, build_drug_protein_dict,  # noqa: E402,F401
                    build_gcn_embeddings, build_gtn_embeddings, build_mol_batch,
                    build_synergy_channels, build_tucker_embeddings, infer_cell_names, l2norm,
@@ -144,6 +145,8 @@ def train_model(name, model, d1, d2, cell, y, tr, va, te, epochs, lr, device, *,
         """Full-length score array (NaN outside `idx`) -- what metrics.evaluate()/within_query
         expect, since within_query's queries reference row indices into the full arrays."""
         model.eval()
+        if hasattr(model, "refresh_drug_streams"):
+            model.refresh_drug_streams()
         out = np.full(len(y), np.nan, dtype=np.float64)
         with torch.no_grad():
             for s in range(0, len(idx), eval_batch):
@@ -159,6 +162,11 @@ def train_model(name, model, d1, d2, cell, y, tr, va, te, epochs, lr, device, *,
 
     for epoch in range(1, epochs + 1):
         model.train()
+        end_to_end = (getattr(model, "gtn_encoder", None) is not None or
+                      getattr(model, "gcn_encoder", None) is not None)
+        if end_to_end:
+            model.refresh_drug_streams()
+            opt.zero_grad()
         perm = np.random.permutation(tr)
         epoch_loss, seen = 0.0, 0
         for s in range(0, len(perm), batch):
@@ -169,13 +177,19 @@ def train_model(name, model, d1, d2, cell, y, tr, va, te, epochs, lr, device, *,
             j = torch.from_numpy(d2[b]).long().to(device)
             c = torch.from_numpy(cell[b]).long().to(device)
             yt = torch.from_numpy(y[b]).float().to(device)
-            opt.zero_grad()
             logit = model(i, j, c)
             loss = loss_fn(logit, yt)
-            loss.backward()
-            opt.step()
+            if end_to_end:
+                (loss * (len(b) / len(perm))).backward(retain_graph=(s + batch < len(perm)))
+            else:
+                opt.zero_grad()
+                loss.backward()
+                opt.step()
             epoch_loss += loss.item() * len(b)
             seen += len(b)
+
+        if end_to_end:
+            opt.step()
 
         val_metrics = M.evaluate(y, score_idx(va), test_idx=va, cell=cell, d1=d1, d2=d2,
                                  queries=val_queries, min_candidates=min_candidates)
@@ -184,10 +198,11 @@ def train_model(name, model, d1, d2, cell, y, tr, va, te, epochs, lr, device, *,
                   f"val_auroc {val_metrics['auroc']:.3f}  val_wq_mrr {val_metrics['wq_mrr']:.3f}")
         if val_metrics["auroc"] > best_val:
             best_val = val_metrics["auroc"]
-            best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
+            best_state = {k: v.detach().clone() for k, v in model.state_dict().items()
+                          if k not in {"stream_gtn", "stream_gcn"}}
 
     if best_state is not None:
-        model.load_state_dict(best_state)
+        model.load_state_dict(best_state, strict=False)
 
     # Antagonism decision threshold is selected on validation predictions, per
     # metrics.select_antagonism_threshold's docstring -- never on test.
@@ -369,18 +384,18 @@ def main():
 
     # ── tg_ features: components 1, 2, 3 (+ the Tucker stream above) ─────────────────────────
     streams, expr = {}, None
+    gtn_graph = gcn_graph = None
     if run_tg:
         if tg_needs("tucker"):
             streams["tucker"] = tuck_norm
         if tg_needs("gtn"):
-            print(f"building GTN embedding on {device} (N={N:,}; needs a few GB, slow on cpu)")
+            print(f"preparing trainable GTN on {device} (N={N:,}; dense graph needs several GB)")
             pos, neg, sim = build_synergy_channels(N, d1, d2, cell, y, tr, te, e_sim)
-            gtn_raw = build_gtn_embeddings(pos, neg, sim, fp_norm, device, node_dim=a.gtn_dim,
-                                           num_channels=a.gtn_channels,
-                                           num_layers=a.gtn_layers, seed=a.seed)
+            adjacency = torch.from_numpy(np.stack([pos, neg, sim], axis=-1))
+            adjacency = torch.cat([adjacency, torch.eye(N).unsqueeze(-1)], dim=-1)
+            gtn_graph = (adjacency, fp_norm)
             del pos, neg, sim
-            streams["gtn"] = l2norm(gtn_raw)
-            print(f"  [gtn] embedding {tuple(gtn_raw.shape)}")
+            streams["gtn"] = torch.zeros(N, a.gtn_dim)
         if tg_needs("gcn"):
             smiles_path = a.smiles_file or (a.data_root / "molecules.csv")
             if not smiles_path.exists():
@@ -392,8 +407,8 @@ def main():
             print(f"  [gcn] SMILES for {len(smiles):,}/{N:,} graph drugs, parsed {len(rows):,}; "
                   f"labelled drugs covered {covered}/{len(labelled)} "
                   f"({covered/len(labelled):.1%}); the rest get a zero vector")
-            streams["gcn"] = l2norm(build_gcn_embeddings(batch_mol, rows, N, device,
-                                                         seed=a.seed))
+            gcn_graph = (batch_mol, rows)
+            streams["gcn"] = torch.zeros(N, 156)
         if tg_needs("expr"):
             expr_path = a.expr_file or (a.data_root / "cell_features" / "cell_line_expression.npz")
             ccle_map = a.ccle_map
@@ -414,10 +429,17 @@ def main():
         # re-seed per arm so a result does not depend on which other arms ran before it
         torch.manual_seed(a.seed); np.random.seed(a.seed)
         if arm in TG_ARMS:
+            cfg = TG_ARMS[arm]
+            gtn_encoder = (TrainableGTNEncoder(
+                *gtn_graph, node_dim=a.gtn_dim, num_channels=a.gtn_channels,
+                num_layers=a.gtn_layers, seed=a.seed) if cfg["gtn"] else None)
+            gcn_encoder = (TrainableGCNEncoder(*gcn_graph, N, seed=a.seed)
+                           if cfg["gcn"] else None)
             model = TensoGraphAblation.from_arm(
                 arm, streams, expr, num_cells, cell_dim=a.cell_dim, expr_hidden=a.expr_hidden,
                 fusion_hidden=a.fusion_hidden,
-                id_cell_dim=32 if a.cell_fallback == "embedding" else 0)
+                id_cell_dim=32 if a.cell_fallback == "embedding" else 0,
+                gtn_encoder=gtn_encoder, gcn_encoder=gcn_encoder)
             lr, batch = a.tg_lr, a.tg_batch
         else:
             node_feat = legacy_node_feat(arm, fp_norm, tuck_norm, protein_tensor_norm,

@@ -424,14 +424,19 @@ def build_mol_batch(smiles_by_idx):
     """Parse every SMILES (largest fragment, so salts/counter-ions drop out) into one PyG Batch.
     Returns (batch, rows): rows[k] is the drug index of graph k. Unparseable SMILES are skipped."""
     graphs, rows, failed = [], [], 0
+    errors = []
     for i, smi in sorted(smiles_by_idx.items()):
         try:
             graphs.append(smiles_to_data(max(smi.split("."), key=len)))
             rows.append(i)
-        except Exception:
+        except Exception as exc:
             failed += 1
+            if len(errors) < 3:
+                errors.append((i, type(exc).__name__, str(exc)))
     if failed:
-        print(f"  [gcn] {failed} SMILES failed to parse and get a zero vector")
+        print(f"  [gcn] {failed} molecules could not be converted and get a zero vector")
+        for i, kind, message in errors:
+            print(f"  [gcn] example conversion error for drug {i}: {kind}: {message}")
     if not graphs:
         raise ValueError("no SMILES could be parsed")
     return Batch.from_data_list(graphs), torch.tensor(rows, dtype=torch.long)

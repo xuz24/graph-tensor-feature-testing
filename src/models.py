@@ -231,7 +231,7 @@ class GTN(nn.Module):
                 X_tmp = F.relu(self.gcn_conv(X,H[i]))
                 semantic_embeddings.append(X_tmp)
         semantic_embeddings = torch.stack(semantic_embeddings, dim=1)
-        return  semantic_embeddings.detach()
+        return semantic_embeddings
     
     
 class SemanticAttention(nn.Module):
@@ -249,7 +249,44 @@ class SemanticAttention(nn.Module):
         beta = torch.softmax(w, dim=0)  # (M, 1)
         beta = beta.expand((z.shape[0],) + beta.shape)  # (N, M, 1)
 
-        return ((beta * z).sum(1)).detach() # (N, D * K)
+        return (beta * z).sum(1) # (N, D * K)
+
+
+class TrainableGTNEncoder(nn.Module):
+    """GTN plus semantic attention with fixed graph/features and trainable weights."""
+    def __init__(self, adjacency, node_features, *, node_dim=32, num_channels=2,
+                 num_layers=2, seed=0):
+        super().__init__()
+        self.register_buffer("adjacency", adjacency.float())
+        self.register_buffer("node_features", node_features.float())
+        with torch.random.fork_rng(devices=[]):
+            torch.manual_seed(seed)
+            self.gtn = GTN(4, num_channels, node_features.shape[1], node_dim,
+                           num_class=2, num_layers=num_layers, norm="true")
+            self.semantic = SemanticAttention(node_dim)
+
+    def forward(self):
+        return self.semantic(self.gtn(self.adjacency, self.node_features))
+
+
+class TrainableGCNEncoder(nn.Module):
+    """Molecular GCN that returns a full drug-indexed matrix; missing drugs stay zero."""
+    def __init__(self, batch, rows, num_drugs, seed=0):
+        super().__init__()
+        self.register_buffer("x", batch.x.float())
+        self.register_buffer("edge_index", batch.edge_index.long())
+        self.register_buffer("batch_index", batch.batch.long())
+        self.register_buffer("rows", rows.long())
+        self.num_drugs = num_drugs
+        with torch.random.fork_rng(devices=[]):
+            torch.manual_seed(seed)
+            self.encoder = DrugGCN()
+
+    def forward(self):
+        graphs = Data(x=self.x, edge_index=self.edge_index, batch=self.batch_index)
+        values = self.encoder(graphs)
+        out = values.new_zeros((self.num_drugs, values.shape[1]))
+        return out.index_copy(0, self.rows, values)
 
 
 class GTLayer(nn.Module):
@@ -520,12 +557,15 @@ class TensoGraphAblation(nn.Module):
     swapped at random per row; at eval the logits of both orders are averaged.
     """
     def __init__(self, drug_streams, num_cells, *, expr=None, stream_mlps=True, fusion_mlp=True,
-                 cell_dim=768, expr_hidden=512, fusion_hidden=8192, id_cell_dim=32):
+                 cell_dim=768, expr_hidden=512, fusion_hidden=8192, id_cell_dim=32,
+                 gtn_encoder=None, gcn_encoder=None):
         super().__init__()
         assert drug_streams, "need at least one drug stream"
         self.stream_names = list(drug_streams)
         for n, t in drug_streams.items():
             self.register_buffer(f"stream_{n}", t.float())
+        self.gtn_encoder = gtn_encoder
+        self.gcn_encoder = gcn_encoder
         dims = {n: int(t.shape[1]) for n, t in drug_streams.items()}
 
         self.use_stream_mlps = stream_mlps
@@ -553,6 +593,13 @@ class TensoGraphAblation(nn.Module):
         sel = {k: streams[k] for k in _STREAMS if cfg[k]}
         return cls(sel, num_cells, expr=expr if cfg["expr"] else None,
                    stream_mlps=cfg["stream_mlps"], fusion_mlp=cfg["fusion_mlp"], **kw)
+
+    def refresh_drug_streams(self):
+        """Recompute differentiable full-drug embeddings once per training epoch."""
+        if self.gtn_encoder is not None:
+            self.stream_gtn = F.normalize(self.gtn_encoder(), p=2, dim=1)
+        if self.gcn_encoder is not None:
+            self.stream_gcn = F.normalize(self.gcn_encoder(), p=2, dim=1)
 
     def _drug_vec(self, idx):
         outs = []
